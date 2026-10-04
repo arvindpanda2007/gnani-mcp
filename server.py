@@ -12,7 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from mcp.server.fastmcp import FastMCP
-
+from mcp.server.transport_security import TransportSecuritySettings
 from gnani.stt import GnaniSTTClient
 from gnani.tts import AudioConfig, GnaniTTSClient, SpeakerEmbedding
 
@@ -42,7 +42,21 @@ ALLOWED_AUDIO_SUFFIXES = {
 
 logger = logging.getLogger("gnani-mcp-remote")
 
-mcp = FastMCP("gnani-mcp-remote")
+transport_security = TransportSecuritySettings(
+    enable_dns_rebinding_protection=True,
+    allowed_hosts=[
+        "gnani-mcp-1.onrender.com",
+        "gnani-mcp-1.onrender.com:*",
+    ],
+    allowed_origins=[
+        "https://gnani-mcp-1.onrender.com",
+    ],
+)
+
+mcp = FastMCP(
+    "gnani-mcp-remote",
+    transport_security=transport_security,
+)
 
 
 # ============================================================
