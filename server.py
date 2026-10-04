@@ -1,5 +1,7 @@
-"""Render-deployable streamable-HTTP MCP server wrapping gnani-vachana."""
+"""Render-deployable Streamable-HTTP MCP server wrapping gnani-vachana."""
+
 from __future__ import annotations
+
 import base64
 import hmac
 import json
@@ -9,134 +11,376 @@ import re
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
 from starlette.responses import JSONResponse, Response
+
 from gnani.stt import GnaniSTTClient
 from gnani.tts import AudioConfig, GnaniTTSClient, SpeakerEmbedding
 
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULT_PORT = 8000
+
+MAX_AUDIO_BYTES = int(
+    os.environ.get("MAX_AUDIO_BYTES", str(25 * 1024 * 1024))
+)
+
+ALLOWED_AUDIO_SUFFIXES = {
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".ogg",
+    ".webm",
+    ".flac",
+    ".aac",
+}
+
+PUBLIC_PATHS = {
+    "/",
+    "/health",
+}
+
+logger = logging.getLogger("gnani-mcp-remote")
+
+mcp = FastMCP("gnani-mcp-remote")
+
+
+# ---------------------------------------------------------------------------
+# Environment / utility helpers
+# ---------------------------------------------------------------------------
+
+def _require_api_key() -> str:
+    """Require the Gnani API key from the environment."""
+    key = os.environ.get("GNANI_API_KEY", "").strip()
+
+    if not key:
         raise RuntimeError(
             "GNANI_API_KEY is missing. Set it in the environment "
             "(Render dashboard or a local .env that is not committed)."
         )
+
     return key
+
+
 def _json_safe(value: Any) -> Any:
+    """Convert SDK responses into JSON-safe values."""
     try:
         json.dumps(value)
         return value
     except TypeError:
         if isinstance(value, dict):
-            return {str(k): _json_safe(v) for k, v in value.items()}
+            return {
+                str(k): _json_safe(v)
+                for k, v in value.items()
+            }
+
         if isinstance(value, (list, tuple)):
-            return [_json_safe(v) for v in value]
+            return [
+                _json_safe(v)
+                for v in value
+            ]
+
         return str(value)
-def _guess_filename(name: str | None, url: str | None) -> str:
+
+
+def _guess_filename(
+    name: str | None,
+    url: str | None,
+) -> str:
+    """Determine a usable audio filename."""
     candidate = (name or "").strip()
+
     if not candidate and url:
-        candidate = os.path.basename(urlparse(url).path)
+        candidate = os.path.basename(
+            urlparse(url).path
+        )
+
     if not candidate:
         return "audio.wav"
+
     lower = candidate.lower()
-    if not any(lower.endswith(ext) for ext in ALLOWED_AUDIO_SUFFIXES):
+
+    if not any(
+        lower.endswith(ext)
+        for ext in ALLOWED_AUDIO_SUFFIXES
+    ):
         return f"{candidate}.wav"
+
     return candidate
-def _decode_base64_audio(audio_base64: str) -> bytes:
+
+
+def _decode_base64_audio(
+    audio_base64: str,
+) -> bytes:
+    """Decode base64 audio."""
     payload = audio_base64.strip()
+
+    # Support data URLs such as:
+    # data:audio/wav;base64,...
     if payload.startswith("data:") and "," in payload:
         payload = payload.split(",", 1)[1]
+
     try:
-        data = base64.b64decode(payload, validate=False)
+        data = base64.b64decode(
+            payload,
+            validate=False,
+        )
     except Exception as exc:
-        raise ValueError(f"audio_base64 is not valid base64: {exc}") from exc
+        raise ValueError(
+            f"audio_base64 is not valid base64: {exc}"
+        ) from exc
+
     if not data:
-        raise ValueError("audio_base64 decoded to empty bytes")
+        raise ValueError(
+            "audio_base64 decoded to empty bytes"
+        )
+
     if len(data) > MAX_AUDIO_BYTES:
-        raise ValueError(f"Audio exceeds {MAX_AUDIO_BYTES} byte limit")
+        raise ValueError(
+            f"Audio exceeds {MAX_AUDIO_BYTES} byte limit"
+        )
+
     return data
+
+
 def _download_audio(url: str) -> bytes:
+    """Download audio from an HTTP(S) URL."""
     parsed = urlparse(url)
+
     if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise ValueError("audio_url must be an http or https URL")
-    request = Request(url, headers={"User-Agent": "gnani-mcp-remote/0.1"})
+        raise ValueError(
+            "audio_url must be an http or https URL"
+        )
+
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "gnani-mcp-remote/0.1"
+        },
+    )
+
     with urlopen(request, timeout=60) as response:  # noqa: S310
         chunks: list[bytes] = []
         total = 0
+
         while True:
             chunk = response.read(64 * 1024)
+
             if not chunk:
                 break
+
             total += len(chunk)
+
             if total > MAX_AUDIO_BYTES:
-                raise ValueError(f"Audio exceeds {MAX_AUDIO_BYTES} byte limit")
+                raise ValueError(
+                    f"Audio exceeds {MAX_AUDIO_BYTES} byte limit"
+                )
+
             chunks.append(chunk)
+
     data = b"".join(chunks)
+
     if not data:
-        raise ValueError("Downloaded audio was empty")
+        raise ValueError(
+            "Downloaded audio was empty"
+        )
+
     return data
-def _parse_shape(shape: list[int] | str) -> list[int]:
+
+
+def _parse_shape(
+    shape: list[int] | str,
+) -> list[int]:
+    """Parse an embedding tensor shape."""
     if isinstance(shape, list):
         return [int(x) for x in shape]
+
     text = shape.strip()
+
     if not text:
         return [1, 768]
+
     try:
         parsed = json.loads(text)
+
         if isinstance(parsed, list):
             return [int(x) for x in parsed]
+
     except json.JSONDecodeError:
         pass
-    numbers = [int(x) for x in re.findall(r"-?\d+", text)]
+
+    numbers = [
+        int(x)
+        for x in re.findall(
+            r"-?\d+",
+            text,
+        )
+    ]
+
     if not numbers:
-        raise ValueError("embedding_shape must be a list of integers, e.g. [1, 768]")
+        raise ValueError(
+            "embedding_shape must be a list of integers, "
+            "e.g. [1, 768]"
+        )
+
     return numbers
+
+
 def _audio_config(
     container: str,
     sample_rate: int,
     encoding: str,
     bitrate: str | None,
 ) -> AudioConfig:
+    """Build Gnani AudioConfig."""
     kwargs: dict[str, Any] = {
         "sample_rate": sample_rate,
         "encoding": encoding,
         "container": container,
     }
+
     if bitrate:
         kwargs["bitrate"] = bitrate
+
     return AudioConfig(**kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Optional bearer authentication
+# ---------------------------------------------------------------------------
+
 class OptionalBearerAuthMiddleware(BaseHTTPMiddleware):
-    """If MCP_AUTH_TOKEN is set, require Bearer auth on MCP routes."""
-    async def dispatch(self, request: StarletteRequest, call_next) -> Response:
-        expected = os.environ.get("MCP_AUTH_TOKEN", "").strip()
+    """
+    If MCP_AUTH_TOKEN is set, require Bearer authentication
+    on MCP routes.
+
+    If MCP_AUTH_TOKEN is not set, authentication is disabled.
+    """
+
+    async def dispatch(
+        self,
+        request: StarletteRequest,
+        call_next,
+    ) -> Response:
+
+        expected = os.environ.get(
+            "MCP_AUTH_TOKEN",
+            "",
+        ).strip()
+
+        # Authentication disabled.
         if not expected:
             return await call_next(request)
-        if request.url.path in PUBLIC_PATHS and request.method == "GET":
-            return await call_next(request)
-        header = request.headers.get("authorization", "")
-        prefix = "Bearer "
-        if not header.startswith(prefix):
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
-        provided = header[len(prefix) :].strip().encode("utf-8")
-        expected_bytes = expected.encode("utf-8")
-        if len(provided) != len(expected_bytes) or not hmac.compare_digest(
-            provided, expected_bytes
+
+        # Allow public health endpoints.
+        if (
+            request.url.path in PUBLIC_PATHS
+            and request.method == "GET"
         ):
-            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            return await call_next(request)
+
+        header = request.headers.get(
+            "authorization",
+            "",
+        )
+
+        prefix = "Bearer "
+
+        if not header.startswith(prefix):
+            return JSONResponse(
+                {"error": "Unauthorized"},
+                status_code=401,
+            )
+
+        provided = header[len(prefix):].strip().encode(
+            "utf-8"
+        )
+
+        expected_bytes = expected.encode(
+            "utf-8"
+        )
+
+        if (
+            len(provided) != len(expected_bytes)
+            or not hmac.compare_digest(
+                provided,
+                expected_bytes,
+            )
+        ):
+            return JSONResponse(
+                {"error": "Unauthorized"},
+                status_code=401,
+            )
+
         return await call_next(request)
-async def health(_: StarletteRequest) -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "gnani-mcp-remote"})
+
+
+# ---------------------------------------------------------------------------
+# Health endpoints
+# ---------------------------------------------------------------------------
+
+async def health(
+    _: StarletteRequest,
+) -> JSONResponse:
+    return JSONResponse(
+        {
+            "status": "ok",
+            "service": "gnani-mcp-remote",
+        }
+    )
+
+
 def _register_health_routes() -> None:
-    custom_route = getattr(mcp, "custom_route", None)
+    """Register simple health endpoints when supported by FastMCP."""
+
+    custom_route = getattr(
+        mcp,
+        "custom_route",
+        None,
+    )
+
     if custom_route is None:
         return
+
     try:
-        custom_route("/", health, methods=["GET"])
-        custom_route("/health", health, methods=["GET"])
+        custom_route(
+            "/",
+            health,
+            methods=["GET"],
+        )
+
+        custom_route(
+            "/health",
+            health,
+            methods=["GET"],
+        )
+
     except TypeError:
-        custom_route("/", methods=["GET"])(health)
-        custom_route("/health", methods=["GET"])(health)
+        custom_route(
+            "/",
+            methods=["GET"],
+        )(health)
+
+        custom_route(
+            "/health",
+            methods=["GET"],
+        )(health)
+
+
 _register_health_routes()
+
+
+# ---------------------------------------------------------------------------
+# Gnani STT
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def transcribe(
     language_code: str = "hi-IN",
@@ -146,21 +390,54 @@ def transcribe(
     output_format: str = "verbatim",
     itn_native_numerals: bool = False,
 ) -> dict[str, Any]:
-    """Speech-to-text via Gnani STT REST (GnaniSTTClient.transcribe_bytes).
-    Provide exactly one of audio_url (http/https) or audio_base64. Use BCP-47
-    language codes such as hi-IN or en-IN. output_format is verbatim (raw)
-    or transcribe (ITN, mainly hi-IN/en-IN).
     """
+    Speech-to-text via Gnani STT.
+
+    Provide exactly one of:
+      - audio_url
+      - audio_base64
+
+    Examples of language codes:
+      - hi-IN
+      - en-IN
+
+    output_format:
+      - verbatim
+      - transcribe
+    """
+
     _require_api_key()
-    has_url = bool(audio_url and audio_url.strip())
-    has_b64 = bool(audio_base64 and audio_base64.strip())
-    if has_url == has_b64:
-        raise ValueError("Provide exactly one of audio_url or audio_base64")
-    audio_bytes = (
-        _download_audio(audio_url.strip()) if has_url else _decode_base64_audio(audio_base64 or "")
+
+    has_url = bool(
+        audio_url and audio_url.strip()
     )
-    name = _guess_filename(filename, audio_url if has_url else None)
+
+    has_b64 = bool(
+        audio_base64 and audio_base64.strip()
+    )
+
+    if has_url == has_b64:
+        raise ValueError(
+            "Provide exactly one of audio_url "
+            "or audio_base64"
+        )
+
+    if has_url:
+        audio_bytes = _download_audio(
+            audio_url.strip()
+        )
+    else:
+        audio_bytes = _decode_base64_audio(
+            audio_base64 or ""
+        )
+
+    name = _guess_filename(
+        filename,
+        audio_url if has_url else None,
+    )
+
     client = GnaniSTTClient()
+
     result = client.transcribe_bytes(
         audio_bytes,
         filename=name,
@@ -168,7 +445,14 @@ def transcribe(
         format=output_format,
         itn_native_numerals=itn_native_numerals,
     )
+
     return _json_safe(result)
+
+
+# ---------------------------------------------------------------------------
+# Gnani TTS
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def synthesize(
     text: str,
@@ -181,16 +465,28 @@ def synthesize(
     encoding: str = "linear_pcm",
     bitrate: str | None = "128k",
 ) -> dict[str, Any]:
-    """Text-to-speech via Gnani TTS REST (GnaniTTSClient.synthesize).
-    Returns base64-encoded audio. For timbre-v2.5, language (e.g. hi-IN) and
-    speed (about 0.85–1.15) are supported. voice is required unless using
-    synthesize_cloned with a speaker embedding.
     """
+    Text-to-speech via Gnani TTS.
+
+    Returns base64-encoded audio.
+    """
+
     _require_api_key()
+
     if not text.strip():
-        raise ValueError("text is required")
-    cfg = _audio_config(container, sample_rate, encoding, bitrate if container == "mp3" else None)
+        raise ValueError(
+            "text is required"
+        )
+
+    cfg = _audio_config(
+        container,
+        sample_rate,
+        encoding,
+        bitrate if container == "mp3" else None,
+    )
+
     client = GnaniTTSClient()
+
     audio = client.synthesize(
         text,
         voice=voice,
@@ -199,14 +495,23 @@ def synthesize(
         speed=speed,
         audio_config=cfg,
     )
+
     return {
         "format": container,
         "sample_rate": sample_rate,
         "voice": voice,
         "model": model,
-        "audio_base64": base64.b64encode(audio).decode("ascii"),
+        "audio_base64": base64.b64encode(
+            audio
+        ).decode("ascii"),
         "byte_length": len(audio),
     }
+
+
+# ---------------------------------------------------------------------------
+# Gnani cloned voice synthesis
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def synthesize_cloned(
     text: str,
@@ -221,19 +526,38 @@ def synthesize_cloned(
     encoding: str = "linear_pcm",
     bitrate: str | None = "128k",
 ) -> dict[str, Any]:
-    """TTS with a Gnani speaker embedding (SDK voice-clone parameter).
-    The gnani-vachana SDK does not create embeddings from a sample clip.
-    Pass an embedding string plus tensor shape/dtype from Gnani. This maps
-    to GnaniTTSClient.synthesize(..., speaker_embedding=SpeakerEmbedding(...)).
     """
+    Text-to-speech using a Gnani speaker embedding.
+
+    The embedding must already have been generated
+    by the Gnani voice-cloning workflow.
+    """
+
     _require_api_key()
+
     if not text.strip():
-        raise ValueError("text is required")
+        raise ValueError(
+            "text is required"
+        )
+
     if not embedding.strip():
-        raise ValueError("embedding is required")
-    shape = _parse_shape(embedding_shape)
-    cfg = _audio_config(container, sample_rate, encoding, bitrate if container == "mp3" else None)
+        raise ValueError(
+            "embedding is required"
+        )
+
+    shape = _parse_shape(
+        embedding_shape
+    )
+
+    cfg = _audio_config(
+        container,
+        sample_rate,
+        encoding,
+        bitrate if container == "mp3" else None,
+    )
+
     client = GnaniTTSClient()
+
     audio = client.synthesize(
         text,
         voice=None,
@@ -247,34 +571,129 @@ def synthesize_cloned(
             dtype=embedding_dtype,
         ),
     )
+
     return {
         "format": container,
         "sample_rate": sample_rate,
         "model": model,
         "used_speaker_embedding": True,
-        "audio_base64": base64.b64encode(audio).decode("ascii"),
+        "audio_base64": base64.b64encode(
+            audio
+        ).decode("ascii"),
         "byte_length": len(audio),
     }
+
+
+# ---------------------------------------------------------------------------
+# Gnani voices
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
-def list_voices(model: str = "timbre-v2.0") -> dict[str, Any]:
-    """List TTS voices for a Timbre model from GnaniTTSClient.supported_voices."""
-    voices = sorted(GnaniTTSClient.supported_voices(model=model))
-    return {"model": model, "voices": voices}
+def list_voices(
+    model: str = "timbre-v2.0",
+) -> dict[str, Any]:
+    """
+    List supported Gnani TTS voices.
+    """
+
+    _require_api_key()
+
+    voices = sorted(
+        GnaniTTSClient.supported_voices(
+            model=model
+        )
+    )
+
+    return {
+        "model": model,
+        "voices": voices,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Gnani STT languages
+# ---------------------------------------------------------------------------
+
 @mcp.tool()
 def list_stt_languages() -> dict[str, Any]:
-    """List STT language codes from GnaniSTTClient.supported_languages."""
-    languages = GnaniSTTClient.supported_languages()
-    return {"languages": _json_safe(languages)}
-def create_app():
-    """ASGI app: streamable HTTP at /mcp plus GET / for Render health checks."""
-    app = mcp.streamable_http_app()
-    app.add_middleware(OptionalBearerAuthMiddleware)
-    return app
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
+    """
+    List supported Gnani STT language codes.
+    """
+
     _require_api_key()
-    port = int(os.environ.get("PORT", str(DEFAULT_PORT)))
-    logger.info("Starting gnani-mcp-remote on 0.0.0.0:%s (MCP path /mcp)", port)
-    uvicorn.run(create_app(), host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
+
+    languages = (
+        GnaniSTTClient.supported_languages()
+    )
+
+    return {
+        "languages": _json_safe(
+            languages
+        )
+    }
+
+
+# ---------------------------------------------------------------------------
+# ASGI / Render startup
+# ---------------------------------------------------------------------------
+
+def create_app():
+    """
+    Create the ASGI application.
+
+    MCP endpoint:
+        /mcp
+
+    Health endpoints:
+        /
+        /health
+    """
+
+    app = mcp.streamable_http_app()
+
+    app.add_middleware(
+        OptionalBearerAuthMiddleware
+    )
+
+    return app
+
+
+def main() -> None:
+    """Start the Render web service."""
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format=(
+            "%(levelname)s "
+            "%(name)s "
+            "%(message)s"
+        ),
+    )
+
+    _require_api_key()
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            str(DEFAULT_PORT),
+        )
+    )
+
+    logger.info(
+        "Starting gnani-mcp-remote "
+        "on 0.0.0.0:%s "
+        "(MCP path /mcp)",
+        port,
+    )
+
+    uvicorn.run(
+        create_app(),
+        host="0.0.0.0",
+        port=port,
+        proxy_headers=True,
+        forwarded_allow_ips="*",
+    )
+
+
 if __name__ == "__main__":
     main()
