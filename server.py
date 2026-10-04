@@ -49,15 +49,12 @@ logger = logging.getLogger("gnani-mcp-remote")
 # MCP TRANSPORT SECURITY
 # ============================================================
 
+_host = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "gnani-mcp-3.onrender.com")
+
 transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=True,
-    allowed_hosts=[
-        "gnani-mcp-1.onrender.com",
-        "gnani-mcp-1.onrender.com:*",
-    ],
-    allowed_origins=[
-        "https://gnani-mcp-1.onrender.com",
-    ],
+    allowed_hosts=[_host, f"{_host}:*"],
+    allowed_origins=[f"https://{_host}"],
 )
 
 
