@@ -11,8 +11,10 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+
 from gnani.stt import GnaniSTTClient
 from gnani.tts import AudioConfig, GnaniTTSClient, SpeakerEmbedding
 
@@ -42,6 +44,11 @@ ALLOWED_AUDIO_SUFFIXES = {
 
 logger = logging.getLogger("gnani-mcp-remote")
 
+
+# ============================================================
+# MCP TRANSPORT SECURITY
+# ============================================================
+
 transport_security = TransportSecuritySettings(
     enable_dns_rebinding_protection=True,
     allowed_hosts=[
@@ -52,6 +59,11 @@ transport_security = TransportSecuritySettings(
         "https://gnani-mcp-1.onrender.com",
     ],
 )
+
+
+# ============================================================
+# MCP SERVER
+# ============================================================
 
 mcp = FastMCP(
     "gnani-mcp-remote",
@@ -64,7 +76,7 @@ mcp = FastMCP(
 # ============================================================
 
 def _require_api_key() -> str:
-    """Require GNANI_API_KEY to be configured."""
+    """Require the Gnani API key."""
 
     key = os.environ.get(
         "GNANI_API_KEY",
@@ -85,7 +97,7 @@ def _require_api_key() -> str:
 # ============================================================
 
 def _json_safe(value: Any) -> Any:
-    """Convert SDK responses into JSON-safe values."""
+    """Convert SDK output into JSON-safe values."""
 
     try:
         json.dumps(value)
@@ -116,7 +128,7 @@ def _guess_filename(
     name: str | None,
     url: str | None,
 ) -> str:
-    """Determine a usable filename for audio."""
+    """Determine a usable audio filename."""
 
     candidate = (name or "").strip()
 
@@ -146,7 +158,7 @@ def _decode_base64_audio(
 
     payload = audio_base64.strip()
 
-    # Support data URLs:
+    # Support:
     # data:audio/wav;base64,...
     if payload.startswith("data:") and "," in payload:
         payload = payload.split(",", 1)[1]
@@ -303,7 +315,7 @@ def _audio_config(
 
 
 # ============================================================
-# STT
+# TOOL 1 — STT
 # ============================================================
 
 @mcp.tool()
@@ -322,7 +334,7 @@ def transcribe(
     - audio_url
     - audio_base64
 
-    Example language codes:
+    Example languages:
     - hi-IN
     - en-IN
 
@@ -377,7 +389,7 @@ def transcribe(
 
 
 # ============================================================
-# TTS
+# TOOL 2 — TTS
 # ============================================================
 
 @mcp.tool()
@@ -440,7 +452,7 @@ def synthesize(
 
 
 # ============================================================
-# CLONED VOICE TTS
+# TOOL 3 — CLONED VOICE
 # ============================================================
 
 @mcp.tool()
@@ -517,7 +529,7 @@ def synthesize_cloned(
 
 
 # ============================================================
-# LIST VOICES
+# TOOL 4 — LIST VOICES
 # ============================================================
 
 @mcp.tool()
@@ -543,7 +555,7 @@ def list_voices(
 
 
 # ============================================================
-# LIST STT LANGUAGES
+# TOOL 5 — LIST STT LANGUAGES
 # ============================================================
 
 @mcp.tool()
@@ -566,11 +578,26 @@ def list_stt_languages() -> dict[str, Any]:
 
 
 # ============================================================
-# SERVER STARTUP
+# ASGI APPLICATION
+# ============================================================
+
+def create_app():
+    """
+    Create the Streamable HTTP ASGI application.
+
+    MCP endpoint:
+        /mcp
+    """
+
+    return mcp.streamable_http_app()
+
+
+# ============================================================
+# RENDER STARTUP
 # ============================================================
 
 def main() -> None:
-    """Start the Streamable HTTP MCP server."""
+    """Start the Gnani MCP server."""
 
     logging.basicConfig(
         level=logging.INFO,
@@ -600,11 +627,12 @@ def main() -> None:
         "MCP endpoint: /mcp"
     )
 
-    mcp.run(
-        transport="streamable-http",
+    uvicorn.run(
+        create_app(),
         host="0.0.0.0",
         port=port,
-        path="/mcp",
+        proxy_headers=True,
+        forwarded_allow_ips="*",
     )
 
 
